@@ -1,0 +1,25 @@
+# --- Secrets / connection info (NEVER commit these) ---
+*.env
+.env*
+appsettings*.json
+*.publishsettings
+secrets*.json
+*.sqlauth
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Power BI (publish DAX snippets + screenshots instead) ---
+*.pbix
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+.vscode/
+
+# --- Optional: large local data dumps ---
+*.bak
+*.bacpac
