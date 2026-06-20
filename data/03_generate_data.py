@@ -13,6 +13,8 @@ Design notes
   left to DAX in Power BI.
 - A few end-of-season games are left as status='scheduled' with no score,
   so 04_simulate_live.sql can flip them later.
+- INSERT ... VALUES is chunked to <= 1000 rows per statement, which is the
+  hard limit SQL Server / Azure SQL enforces.
 
 Usage:  python 03_generate_data.py        # writes 03_data_inserts.sql
 """
@@ -44,7 +46,7 @@ def sql_str(s):
     return "N'" + str(s).replace("'", "''") + "'"
 
 # ---------------- dim_player skeleton ----------------
-players = []          # (player_id, team_id, position, is_pitcher, skill_avg, power)
+players = []
 pid = 1
 for team_id in TEAMS:
     pos_pool = POSITIONS.copy()
@@ -53,7 +55,7 @@ for team_id in TEAMS:
         position = pos_pool[i % len(pos_pool)]
         is_pitcher = (position == 'P')
         skill_avg = max(0.180, min(0.360, random.gauss(0.270, 0.035)))
-        power = random.random()  # 0..1, drives extra-base hits
+        power = random.random()
         players.append({
             'player_id': pid, 'team_id': team_id, 'position': position,
             'bats': random.choice(HANDS), 'throws': random.choice(HANDS),
@@ -78,13 +80,11 @@ games = []
 gid = 1
 for idx, (home, away) in enumerate(matchups):
     gday = season_days[(idx * 3) % len(season_days)]
-    games.append({
-        'game_id': gid, 'date': gday, 'venue_id': home,  # home team's park = venue_id == team_id
-        'home': home, 'away': away,
-    })
+    games.append({'game_id': gid, 'date': gday, 'venue_id': home,
+                  'home': home, 'away': away})
     gid += 1
 games.sort(key=lambda g: g['date'])
-for n, g in enumerate(games):  # renumber game_id by date
+for n, g in enumerate(games):
     g['game_id'] = n + 1
 
 scheduled_ids = {g['game_id'] for g in games[-SCHEDULED_TAIL:]}
@@ -119,7 +119,6 @@ for g in games:
     home_score = runs[g['home']] if is_final else 'NULL'
     away_score = runs[g['away']] if is_final else 'NULL'
 
-    # Ticket sales: aim for a target attendance, split into many transactions
     if is_final:
         target_att = random.randint(1500, 4200)
         att = 0
@@ -153,49 +152,60 @@ for mid in range(1, NUM_MEMBERS + 1):
     tier = random.choices(TIERS, weights=[40, 30, 20, 10])[0]
     member_rows.append((mid, name, email, join, tier))
 
-# ---------------- Write SQL ----------------
-def vals(rows, fmt):
-    return ',\n'.join(fmt(r) for r in rows)
+# ---------------- Write SQL (chunked to <= 1000 rows per INSERT) ----------------
+BATCH = 1000
+
+def write_batched(f, header, rows, fmt):
+    for i in range(0, len(rows), BATCH):
+        chunk = rows[i:i + BATCH]
+        f.write(header + "\n")
+        f.write(',\n'.join(fmt(r) for r in chunk) + ";\n")
+    f.write("\n")
 
 with open(OUT_PATH, 'w', encoding='utf-8') as f:
     f.write("/* 03_data_inserts.sql  auto-generated; run after 01/02 */\n\n")
 
-    f.write("-- dim_player (overwrite full_name with real ABL names later; "
-            "keep player_id)\n")
-    f.write("INSERT INTO dim_player (player_id, full_name, team_id, position, "
-            "bats, throws, jersey_number, nationality) VALUES\n")
-    f.write(vals(players, lambda p: f"({p['player_id']}, "
-            f"{sql_str('Player ' + str(p['player_id']))}, {p['team_id']}, "
-            f"{sql_str(p['position'])}, '{p['bats']}', '{p['throws']}', "
-            f"{p['jersey']}, {sql_str(p['nationality'])})") + ";\n\n")
+    f.write("-- dim_player (overwrite full_name with real ABL names later; keep player_id)\n")
+    write_batched(f,
+        "INSERT INTO dim_player (player_id, full_name, team_id, position, "
+        "bats, throws, jersey_number, nationality) VALUES",
+        players,
+        lambda p: f"({p['player_id']}, {sql_str('Player ' + str(p['player_id']))}, "
+                  f"{p['team_id']}, {sql_str(p['position'])}, '{p['bats']}', "
+                  f"'{p['throws']}', {p['jersey']}, {sql_str(p['nationality'])})")
 
     f.write("-- dim_member (synthetic PII)\n")
-    f.write("INSERT INTO dim_member (member_id, full_name, email, join_date, "
-            "membership_tier) VALUES\n")
-    f.write(vals(member_rows, lambda m: f"({m[0]}, {sql_str(m[1])}, "
-            f"{sql_str(m[2])}, '{m[3]}', {sql_str(m[4])})") + ";\n\n")
+    write_batched(f,
+        "INSERT INTO dim_member (member_id, full_name, email, join_date, "
+        "membership_tier) VALUES",
+        member_rows,
+        lambda m: f"({m[0]}, {sql_str(m[1])}, {sql_str(m[2])}, '{m[3]}', {sql_str(m[4])})")
 
     f.write("-- fact_game\n")
-    f.write("INSERT INTO fact_game (game_id, game_date, date_key, venue_id, "
-            "home_team_id, away_team_id, home_score, away_score, status, "
-            "attendance) VALUES\n")
-    f.write(vals(game_rows, lambda g: f"({g[0]}, '{g[1]}', {g[2]}, {g[3]}, "
-            f"{g[4]}, {g[5]}, {g[6]}, {g[7]}, {sql_str(g[8])}, {g[9]})") + ";\n\n")
+    write_batched(f,
+        "INSERT INTO fact_game (game_id, game_date, date_key, venue_id, "
+        "home_team_id, away_team_id, home_score, away_score, status, attendance) VALUES",
+        game_rows,
+        lambda g: f"({g[0]}, '{g[1]}', {g[2]}, {g[3]}, {g[4]}, {g[5]}, "
+                  f"{g[6]}, {g[7]}, {sql_str(g[8])}, {g[9]})")
 
     f.write("-- fact_player_batting\n")
-    f.write("INSERT INTO fact_player_batting (game_id, player_id, team_id, "
-            "at_bats, hits, doubles, triples, home_runs, rbi, runs, walks, "
-            "strikeouts, stolen_bases, hit_by_pitch) VALUES\n")
-    f.write(vals(bat_rows, lambda b: "(" + ", ".join(str(x) for x in b) + ")") + ";\n\n")
+    write_batched(f,
+        "INSERT INTO fact_player_batting (game_id, player_id, team_id, "
+        "at_bats, hits, doubles, triples, home_runs, rbi, runs, walks, "
+        "strikeouts, stolen_bases, hit_by_pitch) VALUES",
+        bat_rows,
+        lambda b: "(" + ", ".join(str(x) for x in b) + ")")
 
     f.write("-- fact_ticket_sales\n")
-    f.write("INSERT INTO fact_ticket_sales (sale_id, game_id, member_id, "
-            "sale_ts, quantity, unit_price, amount) VALUES\n")
-    f.write(vals(sale_rows, lambda s: f"({s[0]}, {s[1]}, {s[2]}, "
-            f"'{s[3].strftime('%Y-%m-%d %H:%M:%S')}', {s[4]}, {s[5]}, {s[6]})") + ";\n")
+    write_batched(f,
+        "INSERT INTO fact_ticket_sales (sale_id, game_id, member_id, "
+        "sale_ts, quantity, unit_price, amount) VALUES",
+        sale_rows,
+        lambda s: f"({s[0]}, {s[1]}, {s[2]}, '{s[3].strftime('%Y-%m-%d %H:%M:%S')}', "
+                  f"{s[4]}, {s[5]}, {s[6]})")
 
 print(f"players={len(players)}  games={len(game_rows)}  "
-      f"batting_rows={len(bat_rows)}  sales={len(sale_rows)}  "
-      f"members={len(member_rows)}")
+      f"batting_rows={len(bat_rows)}  sales={len(sale_rows)}  members={len(member_rows)}")
 print(f"scheduled (unplayed) = {sorted(scheduled_ids)}")
 print(f"output -> {OUT_PATH}")
